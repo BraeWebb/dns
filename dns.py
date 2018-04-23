@@ -20,26 +20,175 @@ class DomainType(Enum):
     AAAA = 28
 
 
-class DNSRequest(object):
-    def __init__(self, type=DomainType.A):
-        self._id = [random.randint(0, 255), random.randint(0, 255)]
+class DNSAnswer(object):
 
-        self._check_disabled = [1, 0]
-        self._query_count = [0, 1]
-        self._answer_count = [0, 0]
-        self._authority_record_count = [0, 0]
-        self._additional_record_count = [0, 0]
+    SKIP_BYTES = 12
 
-        self._query_type = [0, type.value]
-        self._query_class = [0, 1]
+    @staticmethod
+    def handle_ip4(packet, start):
+        length = DNSAnswer.read_length(packet, start)
+        start = start + DNSAnswer.SKIP_BYTES
 
-    def get_header(self):
-        return self._id + self._check_disabled + self._query_count \
-               + self._answer_count + self._authority_record_count \
-               + self._additional_record_count
+        ip = packet[start: start + length]
+        return ".".join([str(x) for x in ip])
 
-    def get_tail(self):
-        return self._query_type + self._query_class
+    @staticmethod
+    def handle_ip6(packet, start):
+        length = DNSAnswer.read_length(packet, start)
+        start = start + DNSAnswer.SKIP_BYTES
+
+        ip = packet[start: start + length]
+        result = ""
+        for i, num in enumerate(ip):
+            result += format(num, '02x')
+            if i % 2 != 0:
+                result += ":"
+        return result[:-1]
+
+    @staticmethod
+    def handle_mx(packet, start):
+        start = start + DNSAnswer.SKIP_BYTES
+        preference = packet[start+1]
+
+        server = DNSAnswer._handle_mx(packet, start+2)
+        return ".".join(server)
+
+    @staticmethod
+    def _handle_mx(packet, start):
+        current = start + 1
+        length = packet[start]
+
+        sections = []
+
+        while length != 0 and length != 192:
+            sections.append(packet[current:current+length].decode('ISO-8859-1'))
+            current, length = current+length+1, packet[current+length]
+
+        if length == 192:
+            follow = DNSAnswer._handle_mx(packet, packet[current])
+            sections.extend(follow)
+
+        return sections
+
+
+    @staticmethod
+    def handle_cname(packet, start):
+        start = start + DNSAnswer.SKIP_BYTES
+
+        server = DNSAnswer._handle_mx(packet, start)
+        return ".".join(server)
+
+    @staticmethod
+    def handle_txt(packet, start):
+        length = DNSAnswer.read_length(packet, start)
+        start = start + DNSAnswer.SKIP_BYTES
+        return packet[start:start+length].decode('ISO-8859-1')
+
+    @staticmethod
+    def read_length(packet, start):
+        return packet[start + DNSAnswer.SKIP_BYTES - 1]
+
+
+HANDLERS = {
+    DomainType.A: DNSAnswer.handle_ip4,
+    DomainType.AAAA: DNSAnswer.handle_ip6,
+    DomainType.MX: DNSAnswer.handle_mx,
+    DomainType.CNAME: DNSAnswer.handle_cname,
+    DomainType.TXT: DNSAnswer.handle_txt,
+    DomainType.PTR: DNSAnswer.handle_cname
+}
+
+
+class DNSReader(object):
+    def __init__(self, hostname, dns=DNS_SERVER, reverse=False):
+        if reverse:
+            hostname = ".".join(hostname.split(".")[::-1])
+            hostname = hostname + ".in-addr.arpa"
+
+        self.hostname = hostname
+        self.dns = dns
+        self.reverse = reverse
+        self.id = [random.randint(0, 255), random.randint(0, 255)]
+        self.header = self.id + [1, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+        self.queries = []
+
+    def add_query(self, type):
+        if self.reverse and type != DomainType.PTR:
+            log_error(Errors.NON_PTR)
+        self.queries.append(self._generate_query(type))
+
+    @property
+    def requests(self):
+        for query in self.queries:
+            yield bytes(self.header + query)
+
+    @property
+    def answers(self):
+        answers = {}
+
+        for response in self.query(self.dns):
+            for type, answer in self.scan(response):
+                answer_item = answers.get(type, set())
+                answers[type] = answer_item.union([answer])
+
+        return answers
+
+    def query(self, dns_server=DNS_SERVER):
+        with open_socket(dns_server, 53) as socket:
+            for request in self.requests:
+                socket.sendall(request)
+                reply = socket.recv(4096)
+
+                yield bytearray(reply)
+
+    def scan(self, response):
+        if self.id != [response[0], response[1]]:
+            log_error(Errors.DNS_ID_ERROR)
+
+        options = convert_binary(response[2])
+        options += convert_binary(response[3])
+
+        if options[0] != 1:
+            log_error(Errors.NON_RESPONSE_ERROR)
+
+        query_count = response[5]
+        answer_count = response[7]
+        authority_count = response[9]
+        additional_count = response[11]
+
+        start = 16 + len(self._encode_hostname(self.hostname))
+        offset = start
+        for answer in range(answer_count):
+            length = DNSAnswer.read_length(response, offset)
+            yield self.scan_answer(response, offset)
+            offset += length + 12
+
+    def scan_answer(self, response, start):
+        type = DomainType(response[start + 3])
+
+        handler = HANDLERS.get(type, lambda x, y: None)
+        result = handler(response, start)
+
+        return type, result
+
+    def _generate_query(self, type):
+        query = self._encode_hostname(self.hostname)
+        query.extend([0, type.value])
+        query.extend([0, 1])
+        return query
+
+    @staticmethod
+    def _encode_hostname(hostname):
+        parts = hostname.split(".")
+
+        bytes = []
+        for part in parts:
+            bytes.append(len(part))
+            for letter in part:
+                bytes.append(ord(letter))
+        bytes.append(0)
+
+        return bytes
 
 
 class Errors(Enum):
@@ -50,6 +199,7 @@ class Errors(Enum):
     SEND_ERROR = "Could not send data to open TCP socket"
     DNS_ID_ERROR = "DNS ID of response packet does not match request packet"
     NON_RESPONSE_ERROR = "Attempted to read a non-response packet"
+    NON_PTR = "Attempted to add a non-pointer request to reverse lookup"
 
 
 def log_error(error, *parameters):
@@ -90,179 +240,6 @@ def convert_binary(number, length=8):
     return [int(x) for x in '{0:0{1}b}'.format(number, length)]
 
 
-def encode_hostname(hostname):
-    parts = hostname.split(".")
-
-    bytes = []
-
-    for part in parts:
-        bytes.append(len(part))
-        for letter in part:
-            bytes.append(ord(letter))
-    bytes.append(0)
-
-    return bytes
-
-
-def encode_hex(hex_code):
-    data = []
-
-    hex_code = hex_code.replace("\n", " ")
-    for bite in hex_code.split(" "):
-        bite = bite.strip()
-        data.append(int(bite, 16))
-
-    return data
-
-
-def decode_ip(ip):
-    return ".".join([str(x) for x in ip])
-
-
-def decode_ip6(ip):
-    result = ""
-    for i, num in enumerate(ip):
-        result += format(num, '02x')
-        if i % 2 != 0:
-            result += ":"
-    return result[:-1]
-
-
-def decode_email(ip, whole, host_start=0, hostname=""):
-    priority = int.from_bytes(ip[0:2], byteorder='big', signed=False)
-    start = 2
-
-    sections = []
-    while start != 0:
-        if start >= len(ip):
-            print('exceeded')
-            # print(".".join(sections))
-            return sections
-        length = ip[start]
-
-        if length == 192:
-            starting = ip[start+1]-7
-
-            if ip[start+1] == host_start:
-                return sections + [hostname]
-
-            sections.extend(decode_email(whole[starting:], whole,
-                                         host_start=host_start,
-                                         hostname=hostname)[1:])
-            break
-        if length == 0:
-            print("found zero")
-            return sections
-        subsection = ip[start+1:start+length+1]
-
-        section = "".join([format(x, '02x') + " " for x in subsection])
-        section = bytearray.fromhex(section).decode('ISO-8859-1')
-
-        sections.append(section)
-        start = start+length+1
-
-    return sections
-
-
-def decode_txt(ip):
-    length = ip[0]
-    return ip[1:length].decode('ISO-8859-1')
-
-
-def decode_cname(ip, whole):
-    length = ip[0]
-    current = 1
-    sections = []
-
-    while length != 0 and length != 192:
-        sections.append(ip[current:current+length].decode('ISO-8859-1'))
-        current, length = current+length+1, ip[current+length]
-
-    if length == 192:
-        sections.append(decode_cname(whole[ip[current]:], whole))
-
-    return ".".join(sections)
-
-
-def read_answer(bytes, whole, host_start=0, hostname=""):
-
-    length = bytes[11]
-
-    type = DomainType(bytes[3])
-
-    bytes = bytes[12:12+length]
-
-    if type == DomainType.A:
-        ip = decode_ip(bytes)
-    elif type == DomainType.AAAA:
-        ip = decode_ip6(bytes)
-    elif type == DomainType.MX:
-        ip = ".".join(decode_email(bytes, whole, host_start=host_start,
-                                   hostname=hostname))
-    elif type == DomainType.TXT:
-        ip = decode_txt(bytes)
-    elif type == DomainType.CNAME:
-        ip = decode_cname(bytes, whole)
-    elif type ==DomainType.PTR:
-        ip = decode_cname(bytes, whole)
-    else:
-        ip = ""
-
-    return ip, length + 12, type
-
-
-def build_packet(hostname, dns_type=DomainType.A):
-    request = DNSRequest(type=dns_type)
-
-    data = request.get_header()
-    data += encode_hostname(hostname)
-    data += request.get_tail()
-
-    return bytes(data)
-
-
-def dns_lookup(hostname, dns_server=DNS_SERVER, dns_type=DomainType.A):
-    """
-    Use a UDP socket connection to dns_server to retrieve
-    information about the hostname.
-
-    Parameters:
-        hostname (str): The hostname to lookup
-        dns_server (str): The DNS server to connect to
-        dns_type (DomainType): The type of DNS request to make.
-
-    Returns:
-        (str): The IP Address of the hostname
-    """
-    request = DNSRequest(type=dns_type)
-
-    data = request.get_header()
-    data += encode_hostname(hostname)
-    data += request.get_tail()
-
-    ips = {domain: [] for domain in DomainType}
-
-    with open_socket(dns_server, 53) as socket:
-        socket.sendall(bytes(data))
-        reply = socket.recv(4096)
-
-        answers = bytearray(reply)[7]
-
-        if answers == 0:
-            return None
-
-        start = 18 + len(hostname)
-
-        for i in range(answers):
-            ip, offset, type = read_answer(bytearray(reply)[start:], bytearray(reply),
-                                           host_start=len(request.get_header()),
-                                           hostname=hostname)
-            start += offset
-            ips[type].append(ip)
-
-        return ips
-
-
 def main():
     """Main programmy thing, y'all know what it do"""
     parser = argparse.ArgumentParser(description="DNS Lookup Tool")
@@ -276,30 +253,23 @@ def main():
 
     args = parser.parse_args()
 
-    types = {
-        "IPv4": DomainType.A,
-        "IPv6": DomainType.AAAA,
-        "MX": DomainType.MX,
-        "TXT": DomainType.TXT,
-        "CNAME": DomainType.CNAME
-    }
+    packet = DNSReader(args.hostname, dns=args.dns, reverse=args.reverse)
 
     if args.reverse:
-        hostname = ".".join(args.hostname.split(".")[::-1])
-        records = dns_lookup(hostname + ".in-addr.arpa", dns_server=args.dns,
-                             dns_type=DomainType.PTR)
-        if records is None or len(records.get(DomainType.PTR)) == 0:
-            print(f"No Records Found")
-        else:
-            print(f"{', '.join(records.get(DomainType.PTR))}")
-        return
+        packet.add_query(DomainType.PTR)
+    else:
+        packet.add_query(DomainType.A)
+        packet.add_query(DomainType.AAAA)
+        packet.add_query(DomainType.MX)
+        packet.add_query(DomainType.CNAME)
+        packet.add_query(DomainType.TXT)
 
-    for name, type in types.items():
-        records = dns_lookup(args.hostname, dns_server=args.dns, dns_type=type)
-        if records is None or len(records.get(type)) == 0:
-            print(f"{name}: No Records Found")
-        else:
-            print(f"{name}: {', '.join(records.get(type))}")
+    answers = packet.answers
+
+    for type, answers in answers.items():
+        print(type)
+        for answer in answers:
+            print(answer)
         print()
 
 
