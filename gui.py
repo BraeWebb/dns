@@ -1,24 +1,25 @@
 import tkinter as tk
 from tkinter import messagebox as alert
 
-from dns import DNSReader, DomainType
+from dns import DNSReader, DomainType, DNS_SERVER, is_ip
 
 
 class IPInput(tk.Frame):
-    def __init__(self, master, load_func=None, **kwargs):
+    def __init__(self, master, label, has_submit=True, load_func=None, **kwargs):
         super().__init__(master, **kwargs)
 
         self._load_callback = load_func
 
-        self._label = tk.Label(self, text="Enter A Hostname")
-        self._label.pack()
+        self._label = tk.Label(self, text=label)
+        self._label.pack(side=tk.LEFT)
 
         self._field = tk.Entry(self, width=40)
         self._field.bind("<Return>", self._submit)
         self._field.pack(side=tk.LEFT)
 
-        self._submit_button = tk.Button(self, text="Submit", command=self._submit)
-        self._submit_button.pack(side=tk.LEFT)
+        if has_submit:
+            self._submit_button = tk.Button(self, text="Submit", command=self._submit)
+            self._submit_button.pack(side=tk.LEFT)
 
     def _submit(self, _=None):
         hostname = self._field.get()
@@ -32,6 +33,9 @@ class IPInput(tk.Frame):
         if hostname is not None:
             self._field.delete(0, tk.END)
             self._field.insert(0, hostname)
+
+    def get_value(self):
+        return self._field.get()
 
 
 class IPColumn(tk.Frame):
@@ -107,8 +111,11 @@ class DNSWindow(tk.Frame):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
 
-        self._input = IPInput(self, load_func=self.load_ip)
+        self._input = IPInput(self, "Enter Hostname", load_func=self.load_ip)
         self._input.pack(side=tk.TOP)
+        self._dns = IPInput(self, "DNS Server", has_submit=False)
+        self._dns.enable(DNS_SERVER)
+        self._dns.pack(side=tk.TOP)
 
         self._cname = tk.Label(self, text="Canonical Name:")
         self._cname.pack()
@@ -119,7 +126,7 @@ class DNSWindow(tk.Frame):
         }
 
         mail_columns = {
-            "MX Address": 40,
+            "MX Address": 30,
             "IPv4 Addresses": 20,
             "IPv6 Addresses": 40
         }
@@ -131,19 +138,37 @@ class DNSWindow(tk.Frame):
         self._mail_results.pack(side=tk.TOP, padx=30, pady=30)
 
     def load_ip(self, hostname):
-        packet = DNSReader(hostname)
-        packet.add_query(DomainType.A)
-        packet.add_query(DomainType.AAAA)
-        packet.add_query(DomainType.MX)
+        if is_ip(hostname):
+            packet = DNSReader(hostname, dns=self._dns.get_value(), reverse=True)
+            packet.add_query(DomainType.PTR)
+            self.load_reverse(packet, hostname)
+        else:
+            packet = DNSReader(hostname, dns=self._dns.get_value())
+            packet.add_query(DomainType.A)
+            packet.add_query(DomainType.AAAA)
+            packet.add_query(DomainType.MX)
+            self.load_normal(packet, hostname)
 
+    def load_reverse(self, packet, hostname):
+        answers = packet.answers
+
+        if len(answers) == 0 or DomainType.PTR not in answers:
+            alert.showinfo("No Results", f"No results found for {hostname}")
+
+        name = list(answers[DomainType.PTR])
+        alert.showinfo("Hostname", f"Hostname for the ip address {hostname} is {', '.join(name)}")
+
+        self.load_ip(name[0])
+
+    def load_normal(self, packet, hostname):
         answers = packet.answers
 
         if len(answers) == 0:
             alert.showinfo("No Results", f"No results found for {hostname}")
 
         data = {
-            "IPv4 Addresses": answers.get(DomainType.A, ["N/A"]),
-            "IPv6 Addresses": answers.get(DomainType.AAAA, ["N/A"]),
+            "IPv4 Addresses": list(answers.get(DomainType.A, ["N/A"])),
+            "IPv6 Addresses": list(answers.get(DomainType.AAAA, ["N/A"])),
         }
         self._input.enable(hostname=hostname)
         self._results.load(data)
@@ -151,7 +176,7 @@ class DNSWindow(tk.Frame):
         mails = {}
 
         for mail in answers.get(DomainType.MX, []):
-            mx_packet = DNSReader(mail)
+            mx_packet = DNSReader(mail, dns=self._dns.get_value())
             mx_packet.add_query(DomainType.A)
             mx_packet.add_query(DomainType.AAAA)
 
@@ -163,13 +188,12 @@ class DNSWindow(tk.Frame):
             )
 
         data = {
-            "MX Address": mails.keys(),
+            "MX Address": list(mails.keys()),
             "IPv4 Addresses": [x[0] for x in mails.values()],
             "IPv6 Addresses": [x[1] for x in mails.values()],
         }
 
         self._mail_results.load(data)
-
 
         self._cname.config(text=f"Canonical Name: {', '.join(answers.get(DomainType.CNAME, []))}")
 

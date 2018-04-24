@@ -240,6 +240,19 @@ def convert_binary(number, length=8):
     return [int(x) for x in '{0:0{1}b}'.format(number, length)]
 
 
+def is_ip(string):
+    parts = string.split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        try:
+            if int(part) >= 256:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 def main():
     """Main programmy thing, y'all know what it do"""
     parser = argparse.ArgumentParser(description="DNS Lookup Tool")
