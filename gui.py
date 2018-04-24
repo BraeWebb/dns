@@ -1,4 +1,5 @@
 import tkinter as tk
+from tkinter import messagebox as alert
 
 from dns import DNSReader, DomainType
 
@@ -82,6 +83,26 @@ class IPGrid(tk.Frame):
             self._columns[name].load(records)
 
 
+class MailGrid(tk.Frame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+
+        self._columns = {}
+
+        columns = {
+            "IPv4 Addresses": 20,
+            "IPv6 Addresses": 40,
+        }
+
+        for i, (name, width) in enumerate(columns.items()):
+            self._columns[name] = IPColumn(self, name, width, master.load_ip)
+            self._columns[name].grid(row=0, column=i)
+
+    def load(self, data):
+        for name, records in data.items():
+            self._columns[name].load(records)
+
+
 class DNSWindow(tk.Frame):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
@@ -95,11 +116,19 @@ class DNSWindow(tk.Frame):
         data = {
             "IPv4 Addresses": 20,
             "IPv6 Addresses": 40,
-            "MX Addresses": 20,
+        }
+
+        mail_columns = {
+            "MX Address": 40,
+            "IPv4 Addresses": 20,
+            "IPv6 Addresses": 40
         }
 
         self._results = IPGrid(self, data)
-        self._results.pack(side=tk.TOP, padx=30, pady=30)
+        self._results.pack(side=tk.TOP, padx=30)
+
+        self._mail_results = IPGrid(self, mail_columns)
+        self._mail_results.pack(side=tk.TOP, padx=30, pady=30)
 
     def load_ip(self, hostname):
         packet = DNSReader(hostname)
@@ -109,13 +138,39 @@ class DNSWindow(tk.Frame):
 
         answers = packet.answers
 
+        if len(answers) == 0:
+            alert.showinfo("No Results", f"No results found for {hostname}")
+
         data = {
-            "IPv4 Addresses": answers.get(DomainType.A, []),
-            "IPv6 Addresses": answers.get(DomainType.AAAA, []),
-            "MX Addresses": answers.get(DomainType.MX, []),
+            "IPv4 Addresses": answers.get(DomainType.A, ["N/A"]),
+            "IPv6 Addresses": answers.get(DomainType.AAAA, ["N/A"]),
         }
         self._input.enable(hostname=hostname)
         self._results.load(data)
+
+        mails = {}
+
+        for mail in answers.get(DomainType.MX, []):
+            mx_packet = DNSReader(mail)
+            mx_packet.add_query(DomainType.A)
+            mx_packet.add_query(DomainType.AAAA)
+
+            mx_answers = mx_packet.answers
+
+            mails[mail] = (
+                mx_answers.get(DomainType.A, ["N/A"]).pop(),
+                mx_answers.get(DomainType.AAAA, ["N/A"]).pop()
+            )
+
+        data = {
+            "MX Address": mails.keys(),
+            "IPv4 Addresses": [x[0] for x in mails.values()],
+            "IPv6 Addresses": [x[1] for x in mails.values()],
+        }
+
+        self._mail_results.load(data)
+
+
         self._cname.config(text=f"Canonical Name: {', '.join(answers.get(DomainType.CNAME, []))}")
 
 
